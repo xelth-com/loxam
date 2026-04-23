@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "eck-core": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\Dmytro\\eckSnapshot\\scripts\\mcp-eck-core.js"
+      ]
+    }
+  }
+}
