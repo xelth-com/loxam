@@ -1,5 +1,12 @@
 # Loxam Roadmap
 
+
+## Milestone 4: Stateful Beam Search for Monolithic Archives (IN PROGRESS)
+- Replaced `flate2` with `miniz_oxide` to expose cloneable `DecompressorOxide` + `crc32fast::Hasher` state
+- Each `BeamCandidate` holds a clone of decompressor state, rolling 32KB LZ77 window, streaming CRC32 hasher, and its CRLF keep/strip history
+- At each LF position the beam forks (strip CR vs keep CR); inter-LF bytes are fed streaming; candidates that hit `TINFLStatus::Failed` are pruned immediately
+- Beam width capped at 2000, ranked by `total_out DESC` then `inserts ASC`, to survive the combinatorial explosion on archives with a single monolithic compressed payload
+- DFS `keep_one` / `keep_two` kept as safety net for small/medium sections where beam's probabilistic pruning can drop the correct path
 ## Milestone 1: Core Recovery (DONE)
 - ZIP creation, corruption (`\n` → `\r\n`), and basic recovery via "remove all CR" strategy
 - Per-file CRC32 validation with keep_one/keep_two/keep_three patching

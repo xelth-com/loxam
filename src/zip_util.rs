@@ -1,9 +1,6 @@
 use anyhow::{bail, Result};
 use crc32fast::Hasher;
-use flate2::write::DeflateEncoder;
-use flate2::Compression;
 use memchr::memchr_iter;
-use std::io::Write;
 
 pub struct ZipEntry {
     pub name: String,
@@ -27,9 +24,7 @@ pub fn crc32(data: &[u8]) -> u32 {
 }
 
 fn deflate_compress(data: &[u8]) -> Vec<u8> {
-    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(data).unwrap();
-    encoder.finish().unwrap()
+    miniz_oxide::deflate::compress_to_vec(data, 6)
 }
 
 pub fn create_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -294,15 +289,8 @@ pub fn parse_and_validate(data: &[u8]) -> Result<ParsedZip> {
 }
 
 fn try_decompress(data: &[u8]) -> Result<Vec<u8>> {
-    use flate2::read::DeflateDecoder;
-    use std::io::Read;
-
-    let mut decoder = DeflateDecoder::new(data);
-    let mut result = Vec::new();
-    decoder
-        .read_to_end(&mut result)
-        .map_err(|e| anyhow::anyhow!("Decompression failed: {}", e))?;
-    Ok(result)
+    miniz_oxide::inflate::decompress_to_vec(data)
+        .map_err(|e| anyhow::anyhow!("Decompression failed: {:?}", e))
 }
 
 pub fn find_all_lf_positions(data: &[u8]) -> Vec<usize> {

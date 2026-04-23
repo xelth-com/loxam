@@ -2,9 +2,13 @@ use crate::zip_util;
 use anyhow::{bail, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use memchr::memmem;
+use miniz_oxide::inflate::core::{decompress, inflate_flags, DecompressorOxide};
+use miniz_oxide::inflate::TINFLStatus;
 use rayon::prelude::*;
-use std::io::Read;
 use std::time::Instant;
+
+const BEAM_OUT_BUF_SIZE: usize = 32 * 1024;
+const MAX_BEAM_WIDTH: usize = 2000;
 
 pub struct RecoveryResult {
     pub data: Vec<u8>,
@@ -129,26 +133,10 @@ fn corr_to_cand(corr_pos: usize, crlf_positions: &[usize], removed_prefix: &[usi
 }
 
 fn try_decompress_check(data: &[u8], expected_crc: u32) -> bool {
-    let mut decoder = flate2::read::DeflateDecoder::new(data);
-    let mut result = Vec::new();
-    if decoder.read_to_end(&mut result).is_err() {
-        return false;
+    match miniz_oxide::inflate::decompress_to_vec(data) {
+        Ok(out) => zip_util::crc32(&out) == expected_crc,
+        Err(_) => false,
     }
-    zip_util::crc32(&result) == expected_crc
-}
-
-fn try_decompress_count(data: &[u8]) -> usize {
-    let mut decoder = flate2::read::DeflateDecoder::new(data);
-    let mut buf = [0u8; 8192];
-    let mut total = 0usize;
-    loop {
-        match decoder.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(_) => break,
-        }
-    }
-    total
 }
 
 fn try_remove_all(data: &[u8], crlf_positions: &[usize]) -> Option<RecoveryResult> {
@@ -406,8 +394,22 @@ fn try_per_file_fix(
             eprintln!("    {} LF positions in compressed data", lf_positions.len());
 
             let mut attempts = 0u64;
-            let result =
-                dfs_fix_section(compressed_data, entry.crc32_expected, &lf_positions, &mut attempts);
+            let result = beam_search_fix_section(
+                compressed_data,
+                entry.crc32_expected,
+                entry.uncompressed_size,
+                &lf_positions,
+                &mut attempts,
+            )
+            .or_else(|| {
+                eprintln!("    beam failed, falling back to DFS");
+                dfs_fix_section_fallback(
+                    compressed_data,
+                    entry.crc32_expected,
+                    &lf_positions,
+                    &mut attempts,
+                )
+            });
             pb.inc(1);
             (file_idx, result, attempts)
         })
@@ -472,9 +474,91 @@ fn try_per_file_fix(
     })
 }
 
-fn dfs_fix_section(
+#[derive(Clone)]
+struct BeamCandidate {
+    state: Box<DecompressorOxide>,
+    hasher: crc32fast::Hasher,
+    out_buf: Vec<u8>,
+    out_pos: usize,
+    total_out: u64,
+    inserts: Vec<usize>,
+    done: bool,
+}
+
+impl BeamCandidate {
+    fn new() -> Self {
+        BeamCandidate {
+            state: Box::new(DecompressorOxide::new()),
+            hasher: crc32fast::Hasher::new(),
+            out_buf: vec![0u8; BEAM_OUT_BUF_SIZE],
+            out_pos: 0,
+            total_out: 0,
+            inserts: Vec::new(),
+            done: false,
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8], has_more_after: bool) -> Result<(), ()> {
+        if self.done {
+            return if chunk.is_empty() { Ok(()) } else { Err(()) };
+        }
+
+        let buf_len = self.out_buf.len();
+        let mut in_pos = 0usize;
+
+        loop {
+            let more_input = has_more_after || in_pos < chunk.len();
+            let flags = if more_input {
+                inflate_flags::TINFL_FLAG_HAS_MORE_INPUT
+            } else {
+                0
+            };
+
+            let (status, in_consumed, out_consumed) = decompress(
+                &mut *self.state,
+                &chunk[in_pos..],
+                &mut self.out_buf,
+                self.out_pos,
+                flags,
+            );
+
+            in_pos += in_consumed;
+
+            if out_consumed > 0 {
+                let end = self.out_pos + out_consumed;
+                self.hasher.update(&self.out_buf[self.out_pos..end]);
+                self.out_pos = end & (buf_len - 1);
+                self.total_out += out_consumed as u64;
+            }
+
+            match status {
+                TINFLStatus::Done => {
+                    self.done = true;
+                    return if in_pos < chunk.len() { Err(()) } else { Ok(()) };
+                }
+                TINFLStatus::NeedsMoreInput => {
+                    if in_pos >= chunk.len() && has_more_after {
+                        return Ok(());
+                    }
+                    if in_consumed == 0 && out_consumed == 0 {
+                        return Err(());
+                    }
+                }
+                TINFLStatus::HasMoreOutput => {
+                    if in_consumed == 0 && out_consumed == 0 {
+                        return Err(());
+                    }
+                }
+                _ => return Err(()),
+            }
+        }
+    }
+}
+
+fn beam_search_fix_section(
     base: &[u8],
     expected_crc: u32,
+    expected_uncomp_size: u64,
     lf_positions: &[usize],
     total_attempts: &mut u64,
 ) -> Option<Vec<usize>> {
@@ -482,6 +566,118 @@ fn dfs_fix_section(
         return Some(vec![]);
     }
 
+    let n = lf_positions.len();
+    eprintln!(
+        "    beam search over {} LF positions (width={})",
+        n, MAX_BEAM_WIDTH
+    );
+
+    let t = Instant::now();
+    let mut candidates: Vec<BeamCandidate> = vec![BeamCandidate::new()];
+
+    let mut feed_start = 0usize;
+
+    for (i, &lf_pos) in lf_positions.iter().enumerate() {
+        if lf_pos > feed_start {
+            let chunk = &base[feed_start..lf_pos];
+            candidates.retain_mut(|c| c.feed(chunk, true).is_ok());
+            if candidates.is_empty() {
+                eprintln!("    beam empty while feeding before LF #{}", i);
+                return None;
+            }
+        }
+
+        let lf_byte = base[lf_pos];
+        let has_more = lf_pos + 1 < base.len() || (i + 1) < lf_positions.len();
+
+        let mut new_cands: Vec<BeamCandidate> = Vec::with_capacity(candidates.len() * 2);
+        for cand in &candidates {
+            *total_attempts += 2;
+
+            let mut a = cand.clone();
+            if a.feed(&[lf_byte], has_more).is_ok() {
+                new_cands.push(a);
+            }
+
+            let mut b = cand.clone();
+            b.inserts.push(lf_pos);
+            if b.feed(&[0x0D, lf_byte], has_more).is_ok() {
+                new_cands.push(b);
+            }
+        }
+
+        candidates = new_cands;
+        if candidates.is_empty() {
+            eprintln!("    beam empty after fork at LF #{}", i);
+            return None;
+        }
+
+        if candidates.len() > MAX_BEAM_WIDTH {
+            candidates.sort_by(|a, b| {
+                b.total_out
+                    .cmp(&a.total_out)
+                    .then(a.inserts.len().cmp(&b.inserts.len()))
+            });
+            candidates.truncate(MAX_BEAM_WIDTH);
+        }
+
+        if i > 0 && i % 500 == 0 {
+            eprintln!(
+                "    LF {}/{}: beam={}, t={:.2}s",
+                i,
+                n,
+                candidates.len(),
+                t.elapsed().as_secs_f64()
+            );
+        }
+
+        feed_start = lf_pos + 1;
+    }
+
+    if feed_start < base.len() {
+        let chunk = &base[feed_start..];
+        candidates.retain_mut(|c| c.feed(chunk, false).is_ok());
+    } else {
+        candidates.retain_mut(|c| c.feed(&[], false).is_ok());
+    }
+
+    if candidates.is_empty() {
+        eprintln!("    beam empty at final feed");
+        return None;
+    }
+
+    let mut winners: Vec<BeamCandidate> = candidates
+        .into_iter()
+        .filter(|c| c.done && c.total_out == expected_uncomp_size)
+        .collect();
+
+    if winners.is_empty() {
+        eprintln!("    no finished candidates");
+        return None;
+    }
+
+    winners.sort_by_key(|c| c.inserts.len());
+    for cand in winners {
+        if cand.hasher.clone().finalize() == expected_crc {
+            eprintln!(
+                "    beam: {} CRs inserted, {:.2}s",
+                cand.inserts.len(),
+                t.elapsed().as_secs_f64()
+            );
+            return Some(cand.inserts);
+        }
+    }
+
+    eprintln!("    beam: all finished candidates failed CRC");
+    None
+}
+
+fn dfs_fix_section_fallback(
+    base: &[u8],
+    expected_crc: u32,
+    lf_positions: &[usize],
+    total_attempts: &mut u64,
+) -> Option<Vec<usize>> {
     let t = Instant::now();
     let n = lf_positions.len();
 
@@ -492,15 +688,10 @@ fn dfs_fix_section(
         test[pos] = 0x0D;
         test[pos + 1..].copy_from_slice(&base[pos..]);
         if try_decompress_check(&test, expected_crc) {
-            eprintln!("    keep_one at pos {}, {:.2}s", pos, t.elapsed().as_secs_f64());
+            eprintln!("    dfs keep_one at {}, {:.2}s", pos, t.elapsed().as_secs_f64());
             return Some(vec![pos]);
         }
     }
-    eprintln!(
-        "    keep_one failed ({}, {:.2}s)",
-        n,
-        t.elapsed().as_secs_f64()
-    );
 
     if n <= 2000 {
         let t2 = Instant::now();
@@ -517,83 +708,15 @@ fn dfs_fix_section(
                 test[p2 + 2..].copy_from_slice(&base[p2..]);
                 if try_decompress_check(&test, expected_crc) {
                     eprintln!(
-                        "    keep_two at {} + {}, {:.2}s",
+                        "    dfs keep_two at {}+{}, {:.2}s",
                         p1, p2, t2.elapsed().as_secs_f64()
                     );
                     return Some(vec![p1, p2]);
                 }
             }
         }
-        eprintln!(
-            "    keep_two failed ({}, {:.2}s)",
-            n * (n - 1) / 2,
-            t2.elapsed().as_secs_f64()
-        );
     }
 
-    let t3 = Instant::now();
-    let base_score = try_decompress_count(base);
-    let mut scored: Vec<(usize, usize)> = Vec::with_capacity(n);
-
-    {
-        let mut test = vec![0u8; base.len() + 1];
-        for (i, &pos) in lf_positions.iter().enumerate() {
-            *total_attempts += 1;
-            test[..pos].copy_from_slice(&base[..pos]);
-            test[pos] = 0x0D;
-            test[pos + 1..].copy_from_slice(&base[pos..]);
-            let score = try_decompress_count(&test);
-            if score > base_score {
-                scored.push((i, score));
-            }
-        }
-    }
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let top_k = 30.min(scored.len());
-    eprintln!(
-        "    Scoring: {}/{} improved, top-{} for keep_three ({:.2}s)",
-        scored.len(),
-        n,
-        top_k,
-        t3.elapsed().as_secs_f64()
-    );
-
-    if top_k >= 3 {
-        let mut test = vec![0u8; base.len() + 3];
-        for a in 0..top_k {
-            for b in (a + 1)..top_k {
-                for c in (b + 1)..top_k {
-                    *total_attempts += 1;
-                    let mut poses = vec![
-                        lf_positions[scored[a].0],
-                        lf_positions[scored[b].0],
-                        lf_positions[scored[c].0],
-                    ];
-                    poses.sort();
-                    let p1 = poses[0];
-                    let p2 = poses[1];
-                    let p3 = poses[2];
-                    test[..p1].copy_from_slice(&base[..p1]);
-                    test[p1] = 0x0D;
-                    test[p1 + 1..p2 + 1].copy_from_slice(&base[p1..p2]);
-                    test[p2 + 1] = 0x0D;
-                    test[p2 + 2..p3 + 2].copy_from_slice(&base[p2..p3]);
-                    test[p3 + 2] = 0x0D;
-                    test[p3 + 3..].copy_from_slice(&base[p3..]);
-                    if try_decompress_check(&test, expected_crc) {
-                        eprintln!(
-                            "    keep_three ({}/{}/{}) {:.2}s",
-                            a, b, c, t3.elapsed().as_secs_f64()
-                        );
-                        return Some(poses);
-                    }
-                }
-            }
-        }
-    }
-
-    eprintln!("    keep_three failed ({:.2}s)", t3.elapsed().as_secs_f64());
     None
 }
 
