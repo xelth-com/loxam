@@ -34,3 +34,6 @@ stress --runs 20  --size 50000 ->  20/20  Perfect  (improvement on 19/20 baselin
 Strategies observed on the 50KB suite: `remove_all`, `per_file_dfs(1_kept)`, `per_file_dfs(2_kept)`, `patched(1_+1)`, `patched(2_+2fast)` — beam search covers the monolithic scaling case, DFS handles the small-N reliability floor.
 
 Ready for merge.
+
+
+[SYSTEM: EMBEDDED]
