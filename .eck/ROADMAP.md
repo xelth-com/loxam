@@ -1,7 +1,7 @@
 # Loxam Roadmap
 
 
-## Milestone 4: Stateful Beam Search for Monolithic Archives (IN PROGRESS)
+## Milestone 4: Stateful Beam Search for Monolithic Archives (DONE)
 - Replaced `flate2` with `miniz_oxide` to expose cloneable `DecompressorOxide` + `crc32fast::Hasher` state
 - Each `BeamCandidate` holds a clone of decompressor state, rolling 32KB LZ77 window, streaming CRC32 hasher, and its CRLF keep/strip history
 - At each LF position the beam forks (strip CR vs keep CR); inter-LF bytes are fed streaming; candidates that hit `TINFLStatus::Failed` are pruned immediately

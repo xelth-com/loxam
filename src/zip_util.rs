@@ -2,19 +2,11 @@ use anyhow::{bail, Result};
 use crc32fast::Hasher;
 use memchr::memchr_iter;
 
-pub struct ZipEntry {
-    pub name: String,
-    pub data: Vec<u8>,
-}
-
 struct LocalHeaderInfo {
     offset: usize,
     compressed_size: u64,
     uncompressed_size: u64,
     crc32: u32,
-    filename_len: u16,
-    extra_len: u16,
-    method: u16,
 }
 
 pub fn crc32(data: &[u8]) -> u32 {
@@ -51,9 +43,6 @@ pub fn create_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
             compressed_size: compressed.len() as u64,
             uncompressed_size: data.len() as u64,
             crc32: crc,
-            filename_len: name_bytes.len() as u16,
-            extra_len: 0,
-            method: 8,
         });
     }
 
@@ -156,13 +145,10 @@ pub struct ParsedZip {
 
 pub struct ParsedEntry {
     pub name: String,
-    pub compressed_data: Vec<u8>,
-    pub uncompressed_data: Option<Vec<u8>>,
     pub crc32_expected: u32,
     pub crc32_actual: Option<u32>,
     pub compressed_size: u64,
     pub uncompressed_size: u64,
-    pub method: u16,
 }
 
 fn parse_zip64_sizes(
@@ -254,32 +240,22 @@ pub fn parse_and_validate(data: &[u8]) -> Result<ParsedZip> {
             );
         }
 
-        let compressed_data = data[data_start..data_end].to_vec();
+        let compressed_slice = &data[data_start..data_end];
 
-        let (uncompressed_data, crc32_actual) = if method == 8 {
-            match try_decompress(&compressed_data) {
-                Ok(decompressed) => {
-                    let actual_crc = crc32(&decompressed);
-                    (Some(decompressed), Some(actual_crc))
-                }
-                Err(_) => (None, None),
-            }
+        let crc32_actual = if method == 8 {
+            try_decompress(compressed_slice).ok().map(|d| crc32(&d))
         } else if method == 0 {
-            let actual_crc = crc32(&compressed_data);
-            (Some(compressed_data.clone()), Some(actual_crc))
+            Some(crc32(compressed_slice))
         } else {
-            (None, None)
+            None
         };
 
         entries.push(ParsedEntry {
             name,
-            compressed_data,
-            uncompressed_data,
             crc32_expected: crc32_val,
             crc32_actual,
             compressed_size: comp_size,
             uncompressed_size: uncomp_size,
-            method,
         });
 
         pos = data_end;
@@ -291,16 +267,6 @@ pub fn parse_and_validate(data: &[u8]) -> Result<ParsedZip> {
 fn try_decompress(data: &[u8]) -> Result<Vec<u8>> {
     miniz_oxide::inflate::decompress_to_vec(data)
         .map_err(|e| anyhow::anyhow!("Decompression failed: {:?}", e))
-}
-
-pub fn find_all_lf_positions(data: &[u8]) -> Vec<usize> {
-    let mut positions = Vec::new();
-    for i in 0..data.len() {
-        if data[i] == 0x0A {
-            positions.push(i);
-        }
-    }
-    positions
 }
 
 pub fn find_crlf_positions(data: &[u8]) -> Vec<usize> {
