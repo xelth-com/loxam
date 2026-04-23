@@ -525,8 +525,14 @@ impl BeamCandidate {
             in_pos += in_consumed;
 
             if out_consumed > 0 {
-                let end = self.out_pos + out_consumed;
-                self.hasher.update(&self.out_buf[self.out_pos..end]);
+                let start = self.out_pos;
+                let end = start + out_consumed;
+                if end <= buf_len {
+                    self.hasher.update(&self.out_buf[start..end]);
+                } else {
+                    self.hasher.update(&self.out_buf[start..]);
+                    self.hasher.update(&self.out_buf[..(end & (buf_len - 1))]);
+                }
                 self.out_pos = end & (buf_len - 1);
                 self.total_out += out_consumed as u64;
             }
@@ -614,9 +620,10 @@ fn beam_search_fix_section(
 
         if candidates.len() > MAX_BEAM_WIDTH {
             candidates.sort_by(|a, b| {
-                b.total_out
-                    .cmp(&a.total_out)
-                    .then(a.inserts.len().cmp(&b.inserts.len()))
+                a.inserts
+                    .len()
+                    .cmp(&b.inserts.len())
+                    .then(b.total_out.cmp(&a.total_out))
             });
             candidates.truncate(MAX_BEAM_WIDTH);
         }
@@ -681,31 +688,60 @@ fn dfs_fix_section_fallback(
     let t = Instant::now();
     let n = lf_positions.len();
 
-    let mut test = vec![0u8; base.len() + 1];
+    // keep_one: maintain `test` as `base` with a single 0x0D inserted at the
+    // previous LF position. Transition to the next position by shifting the
+    // affected slice by one byte in place — avoids a full O(base.len()) rewrite
+    // on every iteration.
+    let mut test = Vec::with_capacity(base.len() + 1);
+    test.extend_from_slice(base);
+    test.push(0);
+
+    let mut prev_pos: Option<usize> = None;
     for &pos in lf_positions {
         *total_attempts += 1;
-        test[..pos].copy_from_slice(&base[..pos]);
-        test[pos] = 0x0D;
-        test[pos + 1..].copy_from_slice(&base[pos..]);
+        match prev_pos {
+            None => {
+                test.copy_within(pos..base.len(), pos + 1);
+                test[pos] = 0x0D;
+            }
+            Some(prev) => {
+                test.copy_within(prev + 1..pos + 1, prev);
+                test[pos] = 0x0D;
+            }
+        }
         if try_decompress_check(&test, expected_crc) {
             eprintln!("    dfs keep_one at {}, {:.2}s", pos, t.elapsed().as_secs_f64());
             return Some(vec![pos]);
         }
+        prev_pos = Some(pos);
     }
 
     if n <= 2000 {
         let t2 = Instant::now();
         let mut test = vec![0u8; base.len() + 2];
+
         for i in 0..n {
+            let p1 = lf_positions[i];
+            // Reset `test` to `base` with a single insert at p1. The inner loop
+            // will then mutate it incrementally without further full rewrites.
+            test[..p1].copy_from_slice(&base[..p1]);
+            test[p1] = 0x0D;
+            test[p1 + 1..base.len() + 1].copy_from_slice(&base[p1..]);
+
+            let mut prev_p2: Option<usize> = None;
             for j in (i + 1)..n {
                 *total_attempts += 1;
-                let p1 = lf_positions[i];
                 let p2 = lf_positions[j];
-                test[..p1].copy_from_slice(&base[..p1]);
-                test[p1] = 0x0D;
-                test[p1 + 1..p2 + 1].copy_from_slice(&base[p1..p2]);
-                test[p2 + 1] = 0x0D;
-                test[p2 + 2..].copy_from_slice(&base[p2..]);
+                match prev_p2 {
+                    None => {
+                        test.copy_within(p2 + 1..base.len() + 1, p2 + 2);
+                        test[p2 + 1] = 0x0D;
+                    }
+                    Some(prev) => {
+                        test.copy_within(prev + 2..p2 + 2, prev + 1);
+                        test[p2 + 1] = 0x0D;
+                    }
+                }
                 if try_decompress_check(&test, expected_crc) {
                     eprintln!(
                         "    dfs keep_two at {}+{}, {:.2}s",
@@ -713,6 +749,7 @@ fn dfs_fix_section_fallback(
                     );
                     return Some(vec![p1, p2]);
                 }
+                prev_p2 = Some(p2);
             }
         }
     }
