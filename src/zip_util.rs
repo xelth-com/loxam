@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use crc32fast::Hasher;
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
+use memchr::memchr_iter;
 use std::io::Write;
 
 pub struct ZipEntry {
@@ -11,8 +12,8 @@ pub struct ZipEntry {
 
 struct LocalHeaderInfo {
     offset: usize,
-    compressed_size: u32,
-    uncompressed_size: u32,
+    compressed_size: u64,
+    uncompressed_size: u64,
     crc32: u32,
     filename_len: u16,
     extra_len: u16,
@@ -52,8 +53,8 @@ pub fn create_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
 
         local_headers.push(LocalHeaderInfo {
             offset: offset as usize,
-            compressed_size: compressed.len() as u32,
-            uncompressed_size: data.len() as u32,
+            compressed_size: compressed.len() as u64,
+            uncompressed_size: data.len() as u64,
             crc32: crc,
             filename_len: name_bytes.len() as u16,
             extra_len: 0,
@@ -69,8 +70,8 @@ pub fn create_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
             &mut central_dir,
             name.as_bytes(),
             h.offset as u32,
-            h.compressed_size,
-            h.uncompressed_size,
+            h.compressed_size as u32,
+            h.uncompressed_size as u32,
             h.crc32,
         );
     }
@@ -164,9 +165,40 @@ pub struct ParsedEntry {
     pub uncompressed_data: Option<Vec<u8>>,
     pub crc32_expected: u32,
     pub crc32_actual: Option<u32>,
-    pub compressed_size: u32,
-    pub uncompressed_size: u32,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
     pub method: u16,
+}
+
+fn parse_zip64_sizes(
+    extra: &[u8],
+    need_uncomp: bool,
+    need_comp: bool,
+) -> (Option<u64>, Option<u64>) {
+    let mut pos = 0;
+    while pos + 4 <= extra.len() {
+        let id = u16::from_le_bytes(extra[pos..pos + 2].try_into().unwrap());
+        let size = u16::from_le_bytes(extra[pos + 2..pos + 4].try_into().unwrap()) as usize;
+        if id == 0x0001 {
+            let data_start = pos + 4;
+            let data_end = data_start + size;
+            if data_end <= extra.len() {
+                let mut dp = data_start;
+                let mut uncomp = None;
+                let mut comp = None;
+                if need_uncomp && dp + 8 <= data_end {
+                    uncomp = Some(u64::from_le_bytes(extra[dp..dp + 8].try_into().unwrap()));
+                    dp += 8;
+                }
+                if need_comp && dp + 8 <= data_end {
+                    comp = Some(u64::from_le_bytes(extra[dp..dp + 8].try_into().unwrap()));
+                }
+                return (uncomp, comp);
+            }
+        }
+        pos += 4 + size;
+    }
+    (None, None)
 }
 
 pub fn parse_and_validate(data: &[u8]) -> Result<ParsedZip> {
@@ -184,8 +216,8 @@ pub fn parse_and_validate(data: &[u8]) -> Result<ParsedZip> {
 
         let method = u16::from_le_bytes(data[pos + 8..pos + 10].try_into().unwrap());
         let crc32_val = u32::from_le_bytes(data[pos + 14..pos + 18].try_into().unwrap());
-        let comp_size = u32::from_le_bytes(data[pos + 18..pos + 22].try_into().unwrap());
-        let uncomp_size = u32::from_le_bytes(data[pos + 22..pos + 26].try_into().unwrap());
+        let comp_size_raw = u32::from_le_bytes(data[pos + 18..pos + 22].try_into().unwrap());
+        let uncomp_size_raw = u32::from_le_bytes(data[pos + 22..pos + 26].try_into().unwrap());
         let name_len = u16::from_le_bytes(data[pos + 26..pos + 28].try_into().unwrap()) as usize;
         let extra_len = u16::from_le_bytes(data[pos + 28..pos + 30].try_into().unwrap()) as usize;
 
@@ -195,6 +227,28 @@ pub fn parse_and_validate(data: &[u8]) -> Result<ParsedZip> {
         }
 
         let name = String::from_utf8_lossy(&data[pos + 30..pos + 30 + name_len]).to_string();
+
+        let extra_data = if extra_len > 0 && pos + 30 + name_len + extra_len <= data.len() {
+            &data[pos + 30 + name_len..header_end]
+        } else {
+            &[]
+        };
+
+        let (comp_size, uncomp_size): (u64, u64) =
+            if comp_size_raw == 0xFFFFFFFF || uncomp_size_raw == 0xFFFFFFFF {
+                let (u64_val, c64_val) = parse_zip64_sizes(
+                    extra_data,
+                    uncomp_size_raw == 0xFFFFFFFF,
+                    comp_size_raw == 0xFFFFFFFF,
+                );
+                (
+                    c64_val.unwrap_or(comp_size_raw as u64),
+                    u64_val.unwrap_or(uncomp_size_raw as u64),
+                )
+            } else {
+                (comp_size_raw as u64, uncomp_size_raw as u64)
+            };
+
         let data_start = header_end;
         let data_end = data_start + comp_size as usize;
 
@@ -263,9 +317,9 @@ pub fn find_all_lf_positions(data: &[u8]) -> Vec<usize> {
 
 pub fn find_crlf_positions(data: &[u8]) -> Vec<usize> {
     let mut positions = Vec::new();
-    for i in 0..data.len().saturating_sub(1) {
-        if data[i] == 0x0D && data[i + 1] == 0x0A {
-            positions.push(i);
+    for pos in memchr_iter(0x0D, data) {
+        if pos + 1 < data.len() && data[pos + 1] == 0x0A {
+            positions.push(pos);
         }
     }
     positions

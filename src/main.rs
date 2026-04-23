@@ -220,10 +220,12 @@ fn print_extracted_files(data: &[u8]) -> Result<()> {
 }
 
 fn run_corrupt(input: &str, output: &str) -> Result<()> {
-    let data = std::fs::read(input).context("Failed to read input file")?;
+    let file = std::fs::File::open(input).context("Failed to open input file")?;
+    let mmap = unsafe { memmap2::Mmap::map(&file).context("Failed to memory-map input file")? };
+    let data: &[u8] = &mmap;
     println!("Input: {} bytes", data.len());
 
-    let corrupted = corrupt::corrupt(&data);
+    let corrupted = corrupt::corrupt(data);
     println!("Corrupted: {} bytes (+{})", corrupted.len(), corrupted.len() - data.len());
 
     let standalone = corrupt::find_standalone_lf(&data);
@@ -235,10 +237,12 @@ fn run_corrupt(input: &str, output: &str) -> Result<()> {
 }
 
 fn run_recover(input: &str, output: &str) -> Result<()> {
-    let data = std::fs::read(input).context("Failed to read input file")?;
+    let file = std::fs::File::open(input).context("Failed to open input file")?;
+    let mmap = unsafe { memmap2::Mmap::map(&file).context("Failed to memory-map input file")? };
+    let data: &[u8] = &mmap;
     println!("Input: {} bytes", data.len());
 
-    let result = recover::recover(&data).context("Recovery failed")?;
+    let result = recover::recover(data).context("Recovery failed")?;
 
     println!("\nStrategy: {}", result.strategy);
     println!("Attempts: {}", result.attempts);
