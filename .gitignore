@@ -3,3 +3,6 @@
 
 # Added by eck-snapshot to ignore metadata directory
 .eck/
+
+# Local recovery fixtures — real user data, do not publish
+test_scan/
