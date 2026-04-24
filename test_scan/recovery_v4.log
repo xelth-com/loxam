@@ -1,0 +1,17 @@
+Input: 4079532 bytes
+Found 16640 CRLF positions in 4079532 bytes
+Strategy: remove all CR before LF
+  Candidate: 4062892 bytes (corrupted: 4079532, removed 16640)
+'Remove all' not valid (0.18s), running header stabilization...
+Header stabilization: 1 PK\x03\x04, 2 total signatures
+  stabilization decided to keep 0 CRLF(s) across all headers
+  1 file(s) need fix: ["Scan_20260201.png"]
+  'Scan_20260201.png': 4062804 bytes compressed, CRC AE8A16AD
+    16640 LF positions in compressed data
+    using file-signature oracle: 8 bytes ([89, 50, 4E, 47, 0D, 0A, 1A, 0A])
+    beam search over 16640 LF positions (width=2000)
+    LF 500/16640: beam=2000, t=28.02s | inserts [2,38,72] buckets=71 top=[40x29,41x29,42x29,43x29,44x29] | out [114439,114475,114509]/4061587 done=0 | forks a:914619+/102- b:914642+/79- | sig_kills=4
+    LF 1000/16640: beam=2000, t=55.69s | inserts [3,43,82] buckets=80 top=[75x26,76x26,77x26,78x26,4x25] | out [229601,229641,229680]/4061587 done=0 | forks a:923301+/62- b:923271+/92- | sig_kills=0
+    LF 1500/16640: beam=2000, t=84.67s | inserts [3,42,80] buckets=78 top=[21x26,22x26,23x26,24x26,25x26] | out [343429,343468,343506]/4061587 done=0 | forks a:925032+/31- b:925032+/31- | sig_kills=0
+    LF 2000/16640: beam=672, t=115.92s | inserts [3,6,8] buckets=6 top=[5x210,6x210,4x105,7x105,3x21] | out [476835,476838,476840]/4061587 done=0 | forks a:900219+/0- b:900219+/0- | sig_kills=0
+    LF 2500/16640: beam=2000, t=148.55s | inserts [3,38,72] buckets=70 top=[17x29,18x29,19x29,20x29,21x29] | out [603492,603527,603561]/4061587 done=0 | forks a:918152+/21- b:918121+/52- | sig_kills=0

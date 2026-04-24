@@ -1,0 +1,25 @@
+Input: 4079532 bytes
+Found 16640 CRLF positions in 4079532 bytes
+Strategy: remove all CR before LF
+  Candidate: 4062892 bytes (corrupted: 4079532, removed 16640)
+'Remove all' not valid (0.18s), running header stabilization...
+Header stabilization: 1 PK\x03\x04, 2 total signatures
+  stabilization decided to keep 0 CRLF(s) across all headers
+  1 file(s) need fix: ["Scan_20260201.png"]
+  'Scan_20260201.png': 4062804 bytes compressed, CRC AE8A16AD
+    16640 LF positions in compressed data
+    content oracles: prefix=16 bytes, trailer=12 bytes, streaming_validator=true
+    beam search over 16640 LF positions (width=2000)
+    LF 500/16640: beam=2000, t=26.41s | inserts [2,21,40] buckets=39 top=[6x55,7x55,8x55,9x55,10x55] | out [114439,114458,114477]/4061587 done=0 | forks a:714103+/115- b:714128+/90- | sig_kills=0 content_kills=16383
+    LF 1000/16640: beam=2000, t=50.17s | inserts [3,21,38] buckets=36 top=[26x61,27x61,28x61,29x61,30x61] | out [229601,229619,229636]/4061587 done=0 | forks a:650868+/45- b:650823+/90- | sig_kills=0 content_kills=18915
+    LF 1500/16640: beam=2000, t=73.52s | inserts [3,14,24] buckets=22 top=[10x109,11x109,12x109,13x109,14x109] | out [343429,343440,343450]/4061587 done=0 | forks a:623488+/132- b:623433+/187- | sig_kills=0 content_kills=20020
+    LF 2000/16640: beam=32, t=95.33s | inserts [3,6,8] buckets=6 top=[5x10,6x10,4x5,7x5,3x1] | out [476835,476838,476840]/4061587 done=0 | forks a:572710+/93- b:572617+/186- | sig_kills=0 content_kills=32692
+    LF 2500/16640: beam=2000, t=119.54s | inserts [3,18,33] buckets=31 top=[10x72,11x72,12x72,13x72,14x72] | out [603492,603507,603522]/4061587 done=0 | forks a:605105+/277- b:604827+/555- | sig_kills=0 content_kills=32419
+    LF 3000/16640: beam=128, t=143.82s | inserts [7,11,14] buckets=8 top=[10x35,11x35,9x21,12x21,8x7] | out [727045,727049,727052]/4061587 done=0 | forks a:619500+/160- b:619340+/320- | sig_kills=0 content_kills=29606
+    beam empty while feeding before LF #3071 (had 2000 candidates; chunk_len=392)
+    beam failed, falling back to DFS
+    Could not fix 'Scan_20260201.png'
+Error: Recovery failed
+
+Caused by:
+    Recovery failed. 16640 CRLF positions, tried all strategies.

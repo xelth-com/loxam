@@ -1,80 +1,40 @@
 # Agent Report
 
-# Consilium Fixes — Implementation Report
+# Recovery Task Complete — Scan_20260201.png Successfully Restored
 
-## Scope
-Applied the three high-priority changes from the Architect's Consilium task `loxam:implement-consilium-fixes` targeting the beam-search regression on ≥3 MB inputs.
+## Result
+**scan_broken.zip (4,079,532 bytes, FTP-ASCII-corrupted) → scan_fixed.zip (4,062,936 bytes) — BYTE-IDENTICAL to the original scan.zip.**
 
-## Changes Applied
+- `cmp test_scan/scan.zip test_scan/scan_fixed.zip` → identical
+- Compressed PNG stream CRC32 `AE8A16AD` validated OK
+- 44 CRs correctly re-inserted out of 16,640 LF decision points
+- 93,605,252 beam attempts evaluated; final survivor was unique
+- Total wall clock: 19,776 s (≈ 5h 29m)
 
-### TASK 1 — CRC32 ring-buffer wrap fix (`src/recover.rs`, `BeamCandidate::feed`)
+## Final Algorithm (shipped in previous commits)
+1. **Beam search** over 16,640 LF positions, width configurable via `LOXAM_BEAM_WIDTH` env var (used 5000).
+2. **Content oracles** — three gates:
+   - file-signature prefix (8-byte PNG magic)
+   - trailer suffix (IEND chunk)
+   - **streaming PNG chunk validator** (per-chunk length/type/CRC32 — 510 IDAT gates on this file).
+3. **Water-fill bucketed pruning** keyed on `inserts.len()` so tied `total_out` doesn't evict the correct trajectory via stable-sort bias.
+4. **Feed-semantics alignment** with `decompress_to_vec`: `TINFLStatus::Done` with leftover is accepted only at the true final feed.
 
-**Before:** `self.hasher.update(&self.out_buf[self.out_pos..end])` — panicked or silently truncated when `end > buf_len` (i.e. every time the 32 KiB LZ77 window wrapped).
+## Key Recovery Checkpoints (from recovery_v7.log)
+- LF 9500/16640: beam narrowed to **2** (chunk CRC gating worked)
+- LF 14000/16640: beam narrowed to **64** (near convergence)
+- LF 16500/16640: beam narrowed to **16** at 99.2% of output
+- Final feed: 5000 → **1** survivor, `ContentInvalid=4999` (chunk validator killed all wrong trajectories)
+- Trailer oracle: 1 → 1 winner
 
-**After:** Two-segment update when `end > buf_len`:
-```rust
-if end <= buf_len {
-    self.hasher.update(&self.out_buf[start..end]);
-} else {
-    self.hasher.update(&self.out_buf[start..]);
-    self.hasher.update(&self.out_buf[..(end & (buf_len - 1))]);
-}
-```
-This is a genuine correctness bug — any candidate whose decompression output crossed a 32 KiB boundary was producing a wrong CRC32 stream, which would have silently disqualified correct trajectories at the final oracle check.
+## Artifacts
+- `test_scan/scan_fixed.zip` — recovered archive
+- `test_scan/recovery_v{3,4,5,6,7}.log` — iteration logs documenting the v3→v7 fix sequence (UnexpectedDone fix → trailer oracle → chunk validator → beam-width tuning)
 
-### TASK 2 — Inverted beam scoring (`beam_search_fix_section`, ~line 616)
-
-**Before:** `total_out DESC, inserts ASC` — biased toward candidates that greedily decoded more bytes, which lets wrong branches win during the "lazy validation window" before `miniz_oxide` finally flags them.
-
-**After:** `inserts ASC, total_out DESC` — prefers candidates that are committing to fewer `\r` insertions, matching the prior that the true answer has very sparse insertions (~1% of LFs in realistic inputs).
-
-### TASK 3 — DFS fallback incremental mutation (`dfs_fix_section_fallback`)
-
-Replaced three `copy_from_slice` calls per iteration with incremental `copy_within` updates that only touch the changed window.
-
-- `keep_one` loop: **O(base.len() × n) → O(base.len() + n)** total work.
-- `keep_two` inner loop: **O(base.len() × n²) → O(base.len() × n + n²)** total work (outer reset remains O(base.len()) once per outer iter).
-
-For `base.len() ≈ 3 MB` and `n ≈ 2000`, this is a ~2000× speedup for the inner cost.
-
-## Cargo.toml
-Verified already matches the required content byte-for-byte; no write performed.
-
-## Build & Test Results
-
-**Build:** clean release build in 17 s, no warnings.
-
-**Self-test** (`loxam test`): PERFECT MATCH, all CRCs OK.
-
-**50 KB stress baseline** (`loxam stress --runs 20 --size 50000`):
-`Total: 20 | Perfect: 20 | OK: 20 | Failed: 0` — **no regression**.
-
-**PNG 4 MB real-world case** (`test_scan/scan_broken.zip`, 16 640 LF positions):
-
-| Metric | Before fixes | After fixes |
-|---|---|---|
-| Beam dies at LF # | 52 | **6 415** |
-| Beam width at collapse | dropped to 0 rapidly | stayed at 2000 until collapse |
-| Fraction of stream traversed | 0.3% | **38.6%** |
-| Final outcome | failed | failed |
-
-The beam now stays fully saturated (2000/2000) for 6 000+ LF positions before a sudden mass-collapse. This pattern strongly confirms hypothesis **H2** (scoring bias was the primary defect) and also confirms that something else kills the beam at ~LF 6415. The remaining failure mode is almost certainly **H1** (stored Deflate blocks inside the PNG payload give `miniz_oxide` no validation signal), which is an architectural limitation no scoring change can fix.
-
-## Remaining Work / What Architect Should Review
-
-1. **PNG / incompressible content still fails.** This is the stored-block blind spot. Candidates for next milestone:
-   - Parse Deflate block structure (BFINAL/BTYPE), use `LEN/NLEN` check in stored blocks as per-block oracle.
-   - Segment the payload at Deflate block boundaries and solve each block independently with tighter local validation.
-2. **4 MB synthetic compressible stress** (`stress --runs 1 --size 4000000`) not re-run post-fix due to the ~30 min runtime of a single 4 MB beam pass; worth scheduling as a separate verification run.
-3. **Effect of ring-buffer CRC bug** on previously "perfect" stress results is unclear. Short-run tests with `total_out < 32 KiB` never trigger the wrap, so they were accidentally safe. Longer recovery runs may have been producing correct bytes but wrong CRCs — could explain some historical false negatives. Worth a retrospective pass on any stored failure fixtures.
-4. **Test fixtures committed under `test_scan/`:**
-   - `scan.zip` (3.87 MB) — pristine
-   - `scan_broken.zip` (3.89 MB, +16 596 `\r`) — the deterministic 3 MB reproducer the Consilium was based on.
-
-## Files Modified
-- `src/recover.rs` — three hunks (feed CRC update, beam sort, dfs_fix_section_fallback).
-
-## Files Unchanged (as verified)
-- `Cargo.toml` — already matched the specified content.
-
-Ready for Architect review.
+## Issues / Review Notes
+- The run was very slow (~5.5 h with beam=5000 on this single file). For larger corrupted archives or tighter deadlines, consider:
+  - Post-chunk-CRC candidate collapse (when all survivors share identical output prefix + state up to a chunk boundary, a Deflate-state hash could dedup).
+  - Early termination once only 1 candidate remains.
+  - Parallelising per-candidate feed with rayon (each beam iteration's fork is embarrassingly parallel).
+- No algorithmic bugs discovered in the final run — beam width was the only tunable that mattered. Default `DEFAULT_MAX_BEAM_WIDTH = 2000` is too low for highly-corrupted binary streams; this PNG needed ≥ ~3000 to avoid beam-empty. 5000 worked. Consider bumping default to 4000–5000 and documenting the env-var override in README.
+- A `50k_stress` regression was green (20/20) during development — no regressions introduced.
