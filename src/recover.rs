@@ -10,7 +10,19 @@ use rayon::prelude::*;
 use std::time::Instant;
 
 const BEAM_OUT_BUF_SIZE: usize = 32 * 1024;
-const MAX_BEAM_WIDTH: usize = 2000;
+const DEFAULT_MAX_BEAM_WIDTH: usize = 2000;
+
+/// Beam width for stateful search. Overridable via `LOXAM_BEAM_WIDTH` env var
+/// so we can expand capacity for hard cases without a rebuild. Each candidate
+/// costs ~145 KiB (32 KiB LZ77 window + decoder state + hasher + validator),
+/// so 10000 ≈ 1.5 GiB of working memory.
+fn max_beam_width() -> usize {
+    std::env::var("LOXAM_BEAM_WIDTH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&w| w >= 1)
+        .unwrap_or(DEFAULT_MAX_BEAM_WIDTH)
+}
 
 /// Known magic-byte prefixes for common file types. Returned as a static slice
 /// of the raw bytes that MUST appear at offset 0 of the decoded output. Used
@@ -20,7 +32,14 @@ const MAX_BEAM_WIDTH: usize = 2000;
 fn known_signature_for(filename: &str) -> &'static [u8] {
     let lower = filename.to_ascii_lowercase();
     if lower.ends_with(".png") {
-        &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        // PNG signature (8 bytes) + IHDR chunk header: length=13 (4 bytes) +
+        // type="IHDR" (4 bytes). Both are deterministic for any valid PNG,
+        // so extending the prefix from 8 to 16 bytes doubles the number of
+        // LFs that participate in the early oracle check.
+        &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+        ]
     } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
         &[0xFF, 0xD8, 0xFF]
     } else if lower.ends_with(".pdf") {
@@ -42,6 +61,169 @@ fn known_signature_for(filename: &str) -> &'static [u8] {
         &[]
     } else {
         &[]
+    }
+}
+
+/// Streaming PNG chunk validator. Applied per-candidate during beam search:
+/// as decoded bytes emit, `feed` advances through signature -> chunks -> IEND
+/// and verifies every chunk's inline CRC32. A mismatch, an out-of-range
+/// length, or a non-alphabetic chunk type kills the candidate immediately.
+/// Because stored Deflate blocks emit decoded bytes verbatim, wrong CR/no-CR
+/// choices within a stored block corrupt the decoded chunk content — and the
+/// chunk CRC will not match. This is the strongest oracle we have against the
+/// stored-block blind spot.
+#[derive(Clone)]
+enum PngPhase {
+    Signature,
+    ChunkLen,
+    ChunkType,
+    ChunkData,
+    ChunkCrc,
+    PostIend,
+}
+
+#[derive(Clone)]
+struct PngValidator {
+    phase: PngPhase,
+    buf: [u8; 4],
+    buf_len: usize,
+    chunk_len: u32,
+    chunk_type: [u8; 4],
+    chunk_data_remaining: u32,
+    crc: crc32fast::Hasher,
+    sig_pos: usize,
+}
+
+impl PngValidator {
+    fn new() -> Self {
+        PngValidator {
+            phase: PngPhase::Signature,
+            buf: [0u8; 4],
+            buf_len: 0,
+            chunk_len: 0,
+            chunk_type: [0u8; 4],
+            chunk_data_remaining: 0,
+            crc: crc32fast::Hasher::new(),
+            sig_pos: 0,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        let mut i = 0;
+        while i < bytes.len() {
+            // Fast path: inside ChunkData, consume as many bytes as possible
+            // in one shot (CRC hasher SIMD, single subtract).
+            if let PngPhase::ChunkData = self.phase {
+                let avail = bytes.len() - i;
+                let take = (self.chunk_data_remaining as usize).min(avail);
+                if take > 0 {
+                    self.crc.update(&bytes[i..i + take]);
+                    self.chunk_data_remaining -= take as u32;
+                    i += take;
+                }
+                if self.chunk_data_remaining == 0 {
+                    self.phase = PngPhase::ChunkCrc;
+                    self.buf_len = 0;
+                }
+                continue;
+            }
+            if !self.feed_byte(bytes[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    fn feed_byte(&mut self, b: u8) -> bool {
+        match self.phase {
+            PngPhase::Signature => {
+                const SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+                if b != SIG[self.sig_pos] {
+                    return false;
+                }
+                self.sig_pos += 1;
+                if self.sig_pos == 8 {
+                    self.phase = PngPhase::ChunkLen;
+                    self.buf_len = 0;
+                }
+            }
+            PngPhase::ChunkLen => {
+                self.buf[self.buf_len] = b;
+                self.buf_len += 1;
+                if self.buf_len == 4 {
+                    self.chunk_len =
+                        u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]);
+                    // PNG spec: chunk length must not exceed 2^31 - 1.
+                    if self.chunk_len > (1u32 << 31) - 1 {
+                        return false;
+                    }
+                    self.chunk_data_remaining = self.chunk_len;
+                    self.crc = crc32fast::Hasher::new();
+                    self.phase = PngPhase::ChunkType;
+                    self.buf_len = 0;
+                }
+            }
+            PngPhase::ChunkType => {
+                if !((b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A)) {
+                    return false;
+                }
+                self.chunk_type[self.buf_len] = b;
+                self.crc.update(&[b]);
+                self.buf_len += 1;
+                if self.buf_len == 4 {
+                    if self.chunk_data_remaining == 0 {
+                        self.phase = PngPhase::ChunkCrc;
+                        self.buf_len = 0;
+                    } else {
+                        self.phase = PngPhase::ChunkData;
+                    }
+                }
+            }
+            PngPhase::ChunkData => {
+                self.crc.update(&[b]);
+                self.chunk_data_remaining -= 1;
+                if self.chunk_data_remaining == 0 {
+                    self.phase = PngPhase::ChunkCrc;
+                    self.buf_len = 0;
+                }
+            }
+            PngPhase::ChunkCrc => {
+                self.buf[self.buf_len] = b;
+                self.buf_len += 1;
+                if self.buf_len == 4 {
+                    let expected = u32::from_be_bytes([
+                        self.buf[0], self.buf[1], self.buf[2], self.buf[3],
+                    ]);
+                    let actual = self.crc.clone().finalize();
+                    if expected != actual {
+                        return false;
+                    }
+                    if &self.chunk_type == b"IEND" {
+                        self.phase = PngPhase::PostIend;
+                    } else {
+                        self.phase = PngPhase::ChunkLen;
+                    }
+                    self.buf_len = 0;
+                }
+            }
+            PngPhase::PostIend => {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Pick a streaming content validator for a known file type. Returns None if
+/// we have no structural parser for this type (beam search falls back to the
+/// prefix/trailer byte oracles only).
+fn new_validator_for(filename: &str) -> Option<PngValidator> {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".png") {
+        Some(PngValidator::new())
+    } else {
+        None
     }
 }
 
@@ -447,11 +629,13 @@ fn try_per_file_fix(
             let mut attempts = 0u64;
             let expected_prefix = known_signature_for(&entry.name);
             let expected_trailer = known_trailer_for(&entry.name);
-            if !expected_prefix.is_empty() || !expected_trailer.is_empty() {
+            let validator = new_validator_for(&entry.name);
+            if !expected_prefix.is_empty() || !expected_trailer.is_empty() || validator.is_some() {
                 eprintln!(
-                    "    content oracles: prefix={} bytes, trailer={} bytes",
+                    "    content oracles: prefix={} bytes, trailer={} bytes, streaming_validator={}",
                     expected_prefix.len(),
-                    expected_trailer.len()
+                    expected_trailer.len(),
+                    validator.is_some()
                 );
             }
             let result = beam_search_fix_section(
@@ -461,6 +645,7 @@ fn try_per_file_fix(
                 &lf_positions,
                 expected_prefix,
                 expected_trailer,
+                validator,
                 &mut attempts,
             )
             .or_else(|| {
@@ -549,6 +734,9 @@ struct BeamCandidate {
     /// have been verified to match the known file signature. Defaults to
     /// `true` when there is no signature to check.
     prefix_ok: bool,
+    /// Optional streaming content validator. When present, every emitted byte
+    /// is fed to it; a validator-reported violation kills the candidate.
+    validator: Option<PngValidator>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,10 +750,13 @@ enum FeedErr {
     /// Decompressor made no progress on either side (neither input consumed nor
     /// output produced) — stream is malformed at this position.
     Stuck,
+    /// Streaming content validator rejected the emitted bytes (bad signature,
+    /// bad chunk structure, or bad chunk CRC).
+    ContentInvalid,
 }
 
 impl BeamCandidate {
-    fn new(has_signature: bool) -> Self {
+    fn new(has_signature: bool, validator: Option<PngValidator>) -> Self {
         BeamCandidate {
             state: Box::new(DecompressorOxide::new()),
             hasher: crc32fast::Hasher::new(),
@@ -575,6 +766,7 @@ impl BeamCandidate {
             inserts: Vec::new(),
             done: false,
             prefix_ok: !has_signature,
+            validator,
         }
     }
 
@@ -671,9 +863,23 @@ impl BeamCandidate {
                 let end = start + out_consumed;
                 if end <= buf_len {
                     self.hasher.update(&self.out_buf[start..end]);
+                    if let Some(v) = &mut self.validator {
+                        if !v.feed(&self.out_buf[start..end]) {
+                            return Err(FeedErr::ContentInvalid);
+                        }
+                    }
                 } else {
+                    let wrap_end = end & (buf_len - 1);
                     self.hasher.update(&self.out_buf[start..]);
-                    self.hasher.update(&self.out_buf[..(end & (buf_len - 1))]);
+                    self.hasher.update(&self.out_buf[..wrap_end]);
+                    if let Some(v) = &mut self.validator {
+                        if !v.feed(&self.out_buf[start..]) {
+                            return Err(FeedErr::ContentInvalid);
+                        }
+                        if !v.feed(&self.out_buf[..wrap_end]) {
+                            return Err(FeedErr::ContentInvalid);
+                        }
+                    }
                 }
                 self.out_pos = end & (buf_len - 1);
                 self.total_out += out_consumed as u64;
@@ -720,6 +926,7 @@ fn beam_search_fix_section(
     lf_positions: &[usize],
     expected_prefix: &[u8],
     expected_trailer: &[u8],
+    initial_validator: Option<PngValidator>,
     total_attempts: &mut u64,
 ) -> Option<Vec<usize>> {
     if try_decompress_check(base, expected_crc) {
@@ -727,14 +934,16 @@ fn beam_search_fix_section(
     }
 
     let n = lf_positions.len();
+    let beam_cap = max_beam_width();
     eprintln!(
         "    beam search over {} LF positions (width={})",
-        n, MAX_BEAM_WIDTH
+        n, beam_cap
     );
 
     let t = Instant::now();
     let has_signature = !expected_prefix.is_empty();
-    let mut candidates: Vec<BeamCandidate> = vec![BeamCandidate::new(has_signature)];
+    let mut candidates: Vec<BeamCandidate> =
+        vec![BeamCandidate::new(has_signature, initial_validator)];
     let mut prefix_kills: u64 = 0;
 
     let mut feed_start = 0usize;
@@ -747,18 +956,24 @@ fn beam_search_fix_section(
     let mut fork_a_killed = 0u64;
     let mut fork_b_kept = 0u64;
     let mut fork_b_killed = 0u64;
+    let mut content_kills: u64 = 0;
 
     for (i, &lf_pos) in lf_positions.iter().enumerate() {
         if lf_pos > feed_start {
             let chunk = &base[feed_start..lf_pos];
             let before = candidates.len();
-            candidates.retain_mut(|c| c.feed(chunk, true).is_ok());
+            candidates.retain_mut(|c| match c.feed(chunk, true) {
+                Ok(()) => true,
+                Err(FeedErr::ContentInvalid) => {
+                    content_kills += 1;
+                    false
+                }
+                Err(_) => false,
+            });
             if candidates.is_empty() {
                 eprintln!(
                     "    beam empty while feeding before LF #{} (had {} candidates; chunk_len={})",
-                    i,
-                    before,
-                    chunk.len()
+                    i, before, chunk.len()
                 );
                 return None;
             }
@@ -772,20 +987,30 @@ fn beam_search_fix_section(
             *total_attempts += 2;
 
             let mut a = cand.clone();
-            if a.feed(&[lf_byte], has_more).is_ok() {
-                new_cands.push(a);
-                fork_a_kept += 1;
-            } else {
-                fork_a_killed += 1;
+            match a.feed(&[lf_byte], has_more) {
+                Ok(()) => {
+                    new_cands.push(a);
+                    fork_a_kept += 1;
+                }
+                Err(FeedErr::ContentInvalid) => {
+                    fork_a_killed += 1;
+                    content_kills += 1;
+                }
+                Err(_) => fork_a_killed += 1,
             }
 
             let mut b = cand.clone();
             b.inserts.push(lf_pos);
-            if b.feed(&[0x0D, lf_byte], has_more).is_ok() {
-                new_cands.push(b);
-                fork_b_kept += 1;
-            } else {
-                fork_b_killed += 1;
+            match b.feed(&[0x0D, lf_byte], has_more) {
+                Ok(()) => {
+                    new_cands.push(b);
+                    fork_b_kept += 1;
+                }
+                Err(FeedErr::ContentInvalid) => {
+                    fork_b_killed += 1;
+                    content_kills += 1;
+                }
+                Err(_) => fork_b_killed += 1,
             }
         }
 
@@ -821,7 +1046,7 @@ fn beam_search_fix_section(
             }
         }
 
-        if candidates.len() > MAX_BEAM_WIDTH {
+        if candidates.len() > beam_cap {
             // Water-fill bucketed pruning: equal initial quota per insert-count
             // bucket, then redistribute unused slots from under-quota buckets
             // to over-quota ones (sorted smallest bucket first). Within a
@@ -842,8 +1067,8 @@ fn beam_search_fix_section(
             // Smallest buckets first — they get absorbed fully, freeing budget.
             sorted_buckets.sort_by_key(|(_, v)| v.len());
 
-            let mut selected: Vec<BeamCandidate> = Vec::with_capacity(MAX_BEAM_WIDTH);
-            let mut remaining_budget = MAX_BEAM_WIDTH;
+            let mut selected: Vec<BeamCandidate> = Vec::with_capacity(beam_cap);
+            let mut remaining_budget = beam_cap;
             let total_buckets = sorted_buckets.len();
 
             // Deterministic RNG seeded by iteration so results are reproducible
@@ -909,7 +1134,7 @@ fn beam_search_fix_section(
             let done_count = candidates.iter().filter(|c| c.done).count();
 
             eprintln!(
-                "    LF {}/{}: beam={}, t={:.2}s | inserts [{},{},{}] buckets={} top=[{}] | out [{},{},{}]/{} done={} | forks a:{}+/{}- b:{}+/{}- | sig_kills={}",
+                "    LF {}/{}: beam={}, t={:.2}s | inserts [{},{},{}] buckets={} top=[{}] | out [{},{},{}]/{} done={} | forks a:{}+/{}- b:{}+/{}- | sig_kills={} content_kills={}",
                 i,
                 n,
                 candidates.len(),
@@ -922,13 +1147,15 @@ fn beam_search_fix_section(
                 done_count,
                 fork_a_kept, fork_a_killed,
                 fork_b_kept, fork_b_killed,
-                prefix_kills
+                prefix_kills,
+                content_kills
             );
             fork_a_kept = 0;
             fork_a_killed = 0;
             fork_b_kept = 0;
             fork_b_killed = 0;
             prefix_kills = 0;
+            content_kills = 0;
         }
 
         feed_start = lf_pos + 1;
@@ -946,6 +1173,7 @@ fn beam_search_fix_section(
     let mut survived: Vec<BeamCandidate> = Vec::new();
     let mut err_unexpected_done = 0u64;
     let mut err_stuck = 0u64;
+    let mut err_content = 0u64;
     let mut err_bad_status: std::collections::BTreeMap<String, u64> = Default::default();
 
     let final_chunk: Vec<u8> = if feed_start < base.len() {
@@ -959,6 +1187,7 @@ fn beam_search_fix_section(
             Ok(()) => survived.push(c),
             Err(FeedErr::UnexpectedDone) => err_unexpected_done += 1,
             Err(FeedErr::Stuck) => err_stuck += 1,
+            Err(FeedErr::ContentInvalid) => err_content += 1,
             Err(FeedErr::BadStatus(s)) => {
                 *err_bad_status.entry(format!("{:?}", s)).or_insert(0) += 1;
             }
@@ -966,12 +1195,13 @@ fn beam_search_fix_section(
     }
 
     eprintln!(
-        "    final feed: {} -> {} survived (chunk_len={}). errors: UnexpectedDone={}, Stuck={}, BadStatus={:?}",
+        "    final feed: {} -> {} survived (chunk_len={}). errors: UnexpectedDone={}, Stuck={}, ContentInvalid={}, BadStatus={:?}",
         before_final,
         survived.len(),
         final_chunk_len,
         err_unexpected_done,
         err_stuck,
+        err_content,
         err_bad_status
     );
 
@@ -1251,4 +1481,45 @@ fn try_fix_global(data: &[u8], crlf_positions: &[usize]) -> Option<RecoveryResul
         mask[i] = true;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feeds the bytes of a real PNG file through PngValidator in various
+    /// chunk boundaries. The validator must never reject a valid PNG.
+    #[test]
+    fn png_validator_accepts_real_png() {
+        let path = r"C:\Users\Dmytro\loxam\.eck\files\Scan_20260201.png";
+        let data = std::fs::read(path).expect("test PNG missing");
+
+        // One-shot feed
+        let mut v = PngValidator::new();
+        assert!(v.feed(&data), "validator rejected full-PNG single feed");
+
+        // Feed byte-by-byte (stresses all phase transitions)
+        let mut v = PngValidator::new();
+        for (i, &b) in data.iter().enumerate() {
+            assert!(v.feed(&[b]), "byte-by-byte rejection at index {}", i);
+        }
+
+        // Feed with awkward chunk sizes (13 bytes at a time)
+        let mut v = PngValidator::new();
+        for chunk in data.chunks(13) {
+            assert!(v.feed(chunk), "chunked feed rejection");
+        }
+
+        // Feed with random-like chunks
+        let mut v = PngValidator::new();
+        let mut i = 0;
+        let sizes = [1, 2, 7, 37, 128, 1, 3, 4096, 7, 15];
+        let mut si = 0;
+        while i < data.len() {
+            let take = sizes[si % sizes.len()].min(data.len() - i);
+            assert!(v.feed(&data[i..i + take]), "random-chunk rejection at {}", i);
+            i += take;
+            si += 1;
+        }
+    }
 }
