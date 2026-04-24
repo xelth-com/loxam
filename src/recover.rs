@@ -4,6 +4,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use memchr::memmem;
 use miniz_oxide::inflate::core::{decompress, inflate_flags, DecompressorOxide};
 use miniz_oxide::inflate::TINFLStatus;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use rayon::prelude::*;
 use std::time::Instant;
 
@@ -485,6 +487,19 @@ struct BeamCandidate {
     done: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedErr {
+    /// Decompressor said Done but chunk still had unconsumed input, or chunk
+    /// was fed to an already-done candidate.
+    UnexpectedDone,
+    /// Decompressor returned a fatal status (FailedCannotMakeProgress, BadParam,
+    /// Adler32Mismatch, or a negative error code).
+    BadStatus(TINFLStatus),
+    /// Decompressor made no progress on either side (neither input consumed nor
+    /// output produced) — stream is malformed at this position.
+    Stuck,
+}
+
 impl BeamCandidate {
     fn new() -> Self {
         BeamCandidate {
@@ -498,9 +513,13 @@ impl BeamCandidate {
         }
     }
 
-    fn feed(&mut self, chunk: &[u8], has_more_after: bool) -> Result<(), ()> {
+    fn feed(&mut self, chunk: &[u8], has_more_after: bool) -> Result<(), FeedErr> {
         if self.done {
-            return if chunk.is_empty() { Ok(()) } else { Err(()) };
+            return if chunk.is_empty() {
+                Ok(())
+            } else {
+                Err(FeedErr::UnexpectedDone)
+            };
         }
 
         let buf_len = self.out_buf.len();
@@ -540,22 +559,32 @@ impl BeamCandidate {
             match status {
                 TINFLStatus::Done => {
                     self.done = true;
-                    return if in_pos < chunk.len() { Err(()) } else { Ok(()) };
+                    // Align with miniz_oxide::inflate::decompress_to_vec (used
+                    // by DFS's try_decompress_check): at terminal feed we
+                    // tolerate leftover bytes in the chunk, because a
+                    // well-formed stream's BFINAL bit can land before the
+                    // byte-aligned end of the compressed region. Mid-stream
+                    // Done-with-leftover remains an error (it means our
+                    // inserts made the decoder terminate too early).
+                    if in_pos < chunk.len() && has_more_after {
+                        return Err(FeedErr::UnexpectedDone);
+                    }
+                    return Ok(());
                 }
                 TINFLStatus::NeedsMoreInput => {
                     if in_pos >= chunk.len() && has_more_after {
                         return Ok(());
                     }
                     if in_consumed == 0 && out_consumed == 0 {
-                        return Err(());
+                        return Err(FeedErr::Stuck);
                     }
                 }
                 TINFLStatus::HasMoreOutput => {
                     if in_consumed == 0 && out_consumed == 0 {
-                        return Err(());
+                        return Err(FeedErr::Stuck);
                     }
                 }
-                _ => return Err(()),
+                other => return Err(FeedErr::BadStatus(other)),
             }
         }
     }
@@ -583,12 +612,27 @@ fn beam_search_fix_section(
 
     let mut feed_start = 0usize;
 
+    // Per-LF branching counters accumulated since the last progress log,
+    // so we can see survival asymmetry between "no insert" and "insert CR"
+    // forks — if the correct trajectory is being evicted, the asymmetry often
+    // shifts dramatically.
+    let mut fork_a_kept = 0u64;
+    let mut fork_a_killed = 0u64;
+    let mut fork_b_kept = 0u64;
+    let mut fork_b_killed = 0u64;
+
     for (i, &lf_pos) in lf_positions.iter().enumerate() {
         if lf_pos > feed_start {
             let chunk = &base[feed_start..lf_pos];
+            let before = candidates.len();
             candidates.retain_mut(|c| c.feed(chunk, true).is_ok());
             if candidates.is_empty() {
-                eprintln!("    beam empty while feeding before LF #{}", i);
+                eprintln!(
+                    "    beam empty while feeding before LF #{} (had {} candidates; chunk_len={})",
+                    i,
+                    before,
+                    chunk.len()
+                );
                 return None;
             }
         }
@@ -603,112 +647,230 @@ fn beam_search_fix_section(
             let mut a = cand.clone();
             if a.feed(&[lf_byte], has_more).is_ok() {
                 new_cands.push(a);
+                fork_a_kept += 1;
+            } else {
+                fork_a_killed += 1;
             }
 
             let mut b = cand.clone();
             b.inserts.push(lf_pos);
             if b.feed(&[0x0D, lf_byte], has_more).is_ok() {
                 new_cands.push(b);
+                fork_b_kept += 1;
+            } else {
+                fork_b_killed += 1;
             }
         }
 
         candidates = new_cands;
         if candidates.is_empty() {
-            eprintln!("    beam empty after fork at LF #{}", i);
+            eprintln!(
+                "    beam empty after fork at LF #{} (fork_a: {}/{}, fork_b: {}/{})",
+                i,
+                fork_a_kept,
+                fork_a_kept + fork_a_killed,
+                fork_b_kept,
+                fork_b_kept + fork_b_killed
+            );
             return None;
         }
 
         if candidates.len() > MAX_BEAM_WIDTH {
-            // Diversity-preserving pruning: bucket candidates by inserts.len()
-            // and keep a per-bucket quota, so the correct trajectory — which
-            // may have a "middling" number of inserts — is not evicted by a
-            // flood of low-insert candidates that are still plausible inside
-            // stored Deflate blocks. Within each bucket, higher total_out wins.
-            candidates.sort_by(|a, b| {
-                a.inserts
-                    .len()
-                    .cmp(&b.inserts.len())
-                    .then(b.total_out.cmp(&a.total_out))
-            });
-
-            let distinct_buckets = {
-                let mut count = 0usize;
-                let mut last: Option<usize> = None;
-                for c in &candidates {
-                    let key = c.inserts.len();
-                    if Some(key) != last {
-                        count += 1;
-                        last = Some(key);
-                    }
-                }
-                count
-            };
-            let per_bucket = (MAX_BEAM_WIDTH / distinct_buckets.max(1)).max(1);
-
-            let mut selected: Vec<BeamCandidate> = Vec::with_capacity(MAX_BEAM_WIDTH);
-            let mut leftovers: Vec<BeamCandidate> = Vec::new();
-            let mut current_key: Option<usize> = None;
-            let mut taken_in_bucket = 0usize;
+            // Water-fill bucketed pruning: equal initial quota per insert-count
+            // bucket, then redistribute unused slots from under-quota buckets
+            // to over-quota ones (sorted smallest bucket first). Within a
+            // bucket that must be truncated, shuffle deterministically so the
+            // correct trajectory isn't evicted by tied total_out and stable
+            // insertion order — every candidate in the bucket gets equal
+            // probability of surviving a cut. Tied total_out is the common
+            // case inside stored Deflate blocks, where 100+ candidates can
+            // share identical decode progress.
+            let mut by_bucket: std::collections::BTreeMap<usize, Vec<BeamCandidate>> =
+                Default::default();
             for cand in candidates.drain(..) {
-                let key = cand.inserts.len();
-                if Some(key) != current_key {
-                    current_key = Some(key);
-                    taken_in_bucket = 0;
-                }
-                if taken_in_bucket < per_bucket {
-                    selected.push(cand);
-                    taken_in_bucket += 1;
-                } else {
-                    leftovers.push(cand);
-                }
+                by_bucket.entry(cand.inserts.len()).or_default().push(cand);
             }
 
-            let remaining_budget = MAX_BEAM_WIDTH.saturating_sub(selected.len());
-            for cand in leftovers.into_iter().take(remaining_budget) {
-                selected.push(cand);
+            let mut sorted_buckets: Vec<(usize, Vec<BeamCandidate>)> =
+                by_bucket.into_iter().collect();
+            // Smallest buckets first — they get absorbed fully, freeing budget.
+            sorted_buckets.sort_by_key(|(_, v)| v.len());
+
+            let mut selected: Vec<BeamCandidate> = Vec::with_capacity(MAX_BEAM_WIDTH);
+            let mut remaining_budget = MAX_BEAM_WIDTH;
+            let total_buckets = sorted_buckets.len();
+
+            // Deterministic RNG seeded by iteration so results are reproducible
+            // across runs but differ between iterations (avoids always
+            // evicting the same candidate position).
+            let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0DE_F00D ^ (i as u64));
+
+            for (idx, (_, mut bucket)) in sorted_buckets.into_iter().enumerate() {
+                let buckets_left = total_buckets - idx;
+                let per = (remaining_budget / buckets_left).max(1);
+                let take = bucket.len().min(per);
+
+                if bucket.len() > take {
+                    // Partial-shuffle the first `take` slots uniformly among
+                    // all candidates, then truncate. This samples without
+                    // replacement from the bucket with uniform probability —
+                    // O(bucket.len()) time without a full sort.
+                    bucket.partial_shuffle(&mut rng, take);
+                    bucket.truncate(take);
+                }
+                remaining_budget = remaining_budget.saturating_sub(bucket.len());
+                selected.append(&mut bucket);
             }
 
             candidates = selected;
         }
 
-        if i > 0 && i % 500 == 0 {
+        let log_this = (i > 0 && i % 500 == 0) || (i + 1 == n);
+        if log_this {
+            // inserts.len() distribution across the beam — min/median/max and
+            // top 5 most-populous buckets.
+            let mut lens: Vec<usize> = candidates.iter().map(|c| c.inserts.len()).collect();
+            lens.sort_unstable();
+            let lmin = lens.first().copied().unwrap_or(0);
+            let lmax = lens.last().copied().unwrap_or(0);
+            let lmed = lens.get(lens.len() / 2).copied().unwrap_or(0);
+
+            let mut bucket_counts: Vec<(usize, usize)> = Vec::new();
+            let mut cur_key = usize::MAX;
+            for &l in &lens {
+                if l != cur_key {
+                    bucket_counts.push((l, 1));
+                    cur_key = l;
+                } else {
+                    let last = bucket_counts.last_mut().unwrap();
+                    last.1 += 1;
+                }
+            }
+            bucket_counts.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<String> = bucket_counts
+                .iter()
+                .take(5)
+                .map(|(k, v)| format!("{}x{}", k, v))
+                .collect();
+
+            // total_out distribution — how far decoded
+            let mut outs: Vec<u64> = candidates.iter().map(|c| c.total_out).collect();
+            outs.sort_unstable();
+            let omin = outs.first().copied().unwrap_or(0);
+            let omax = outs.last().copied().unwrap_or(0);
+            let omed = outs.get(outs.len() / 2).copied().unwrap_or(0);
+
+            let done_count = candidates.iter().filter(|c| c.done).count();
+
             eprintln!(
-                "    LF {}/{}: beam={}, t={:.2}s",
+                "    LF {}/{}: beam={}, t={:.2}s | inserts [{},{},{}] buckets={} top=[{}] | out [{},{},{}]/{} done={} | forks a:{}+/{}- b:{}+/{}-",
                 i,
                 n,
                 candidates.len(),
-                t.elapsed().as_secs_f64()
+                t.elapsed().as_secs_f64(),
+                lmin, lmed, lmax,
+                bucket_counts.len(),
+                top.join(","),
+                omin, omed, omax,
+                expected_uncomp_size,
+                done_count,
+                fork_a_kept, fork_a_killed,
+                fork_b_kept, fork_b_killed
             );
+            fork_a_kept = 0;
+            fork_a_killed = 0;
+            fork_b_kept = 0;
+            fork_b_killed = 0;
         }
 
         feed_start = lf_pos + 1;
     }
 
-    if feed_start < base.len() {
-        let chunk = &base[feed_start..];
-        candidates.retain_mut(|c| c.feed(chunk, false).is_ok());
+    let before_final = candidates.len();
+    let final_chunk_len = if feed_start < base.len() {
+        base.len() - feed_start
     } else {
-        candidates.retain_mut(|c| c.feed(&[], false).is_ok());
+        0
+    };
+
+    // Final feed: track failure reason for every candidate so we understand
+    // *why* the stream couldn't terminate cleanly.
+    let mut survived: Vec<BeamCandidate> = Vec::new();
+    let mut err_unexpected_done = 0u64;
+    let mut err_stuck = 0u64;
+    let mut err_bad_status: std::collections::BTreeMap<String, u64> = Default::default();
+
+    let final_chunk: Vec<u8> = if feed_start < base.len() {
+        base[feed_start..].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    for mut c in candidates.drain(..) {
+        match c.feed(&final_chunk, false) {
+            Ok(()) => survived.push(c),
+            Err(FeedErr::UnexpectedDone) => err_unexpected_done += 1,
+            Err(FeedErr::Stuck) => err_stuck += 1,
+            Err(FeedErr::BadStatus(s)) => {
+                *err_bad_status.entry(format!("{:?}", s)).or_insert(0) += 1;
+            }
+        }
     }
 
-    if candidates.is_empty() {
+    eprintln!(
+        "    final feed: {} -> {} survived (chunk_len={}). errors: UnexpectedDone={}, Stuck={}, BadStatus={:?}",
+        before_final,
+        survived.len(),
+        final_chunk_len,
+        err_unexpected_done,
+        err_stuck,
+        err_bad_status
+    );
+
+    if survived.is_empty() {
         eprintln!("    beam empty at final feed");
         return None;
     }
 
-    let mut winners: Vec<BeamCandidate> = candidates
+    // Categorise survivors: done vs not done, total_out vs expected.
+    let done_total = survived.iter().filter(|c| c.done).count();
+    let size_match = survived
+        .iter()
+        .filter(|c| c.total_out == expected_uncomp_size)
+        .count();
+    let done_and_size = survived
+        .iter()
+        .filter(|c| c.done && c.total_out == expected_uncomp_size)
+        .count();
+    let mut outs: Vec<u64> = survived.iter().map(|c| c.total_out).collect();
+    outs.sort_unstable();
+    let omin = outs.first().copied().unwrap_or(0);
+    let omax = outs.last().copied().unwrap_or(0);
+    let omed = outs.get(outs.len() / 2).copied().unwrap_or(0);
+
+    eprintln!(
+        "    survivors: done={}, size_match={}, done+size={}, total_out range=[{}, median {}, {}]/{}",
+        done_total, size_match, done_and_size, omin, omed, omax, expected_uncomp_size
+    );
+
+    let mut winners: Vec<BeamCandidate> = survived
         .into_iter()
         .filter(|c| c.done && c.total_out == expected_uncomp_size)
         .collect();
 
     if winners.is_empty() {
-        eprintln!("    no finished candidates");
+        eprintln!(
+            "    no finished candidates (need both done=true and total_out={})",
+            expected_uncomp_size
+        );
         return None;
     }
 
     winners.sort_by_key(|c| c.inserts.len());
+    let mut crc_fail = 0u64;
     for cand in winners {
-        if cand.hasher.clone().finalize() == expected_crc {
+        let got_crc = cand.hasher.clone().finalize();
+        if got_crc == expected_crc {
             eprintln!(
                 "    beam: {} CRs inserted, {:.2}s",
                 cand.inserts.len(),
@@ -716,9 +878,13 @@ fn beam_search_fix_section(
             );
             return Some(cand.inserts);
         }
+        crc_fail += 1;
     }
 
-    eprintln!("    beam: all finished candidates failed CRC");
+    eprintln!(
+        "    beam: all {} finished candidates failed CRC (expected {:08X})",
+        crc_fail, expected_crc
+    );
     None
 }
 
