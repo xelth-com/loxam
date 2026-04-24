@@ -619,13 +619,56 @@ fn beam_search_fix_section(
         }
 
         if candidates.len() > MAX_BEAM_WIDTH {
+            // Diversity-preserving pruning: bucket candidates by inserts.len()
+            // and keep a per-bucket quota, so the correct trajectory — which
+            // may have a "middling" number of inserts — is not evicted by a
+            // flood of low-insert candidates that are still plausible inside
+            // stored Deflate blocks. Within each bucket, higher total_out wins.
             candidates.sort_by(|a, b| {
                 a.inserts
                     .len()
                     .cmp(&b.inserts.len())
                     .then(b.total_out.cmp(&a.total_out))
             });
-            candidates.truncate(MAX_BEAM_WIDTH);
+
+            let distinct_buckets = {
+                let mut count = 0usize;
+                let mut last: Option<usize> = None;
+                for c in &candidates {
+                    let key = c.inserts.len();
+                    if Some(key) != last {
+                        count += 1;
+                        last = Some(key);
+                    }
+                }
+                count
+            };
+            let per_bucket = (MAX_BEAM_WIDTH / distinct_buckets.max(1)).max(1);
+
+            let mut selected: Vec<BeamCandidate> = Vec::with_capacity(MAX_BEAM_WIDTH);
+            let mut leftovers: Vec<BeamCandidate> = Vec::new();
+            let mut current_key: Option<usize> = None;
+            let mut taken_in_bucket = 0usize;
+            for cand in candidates.drain(..) {
+                let key = cand.inserts.len();
+                if Some(key) != current_key {
+                    current_key = Some(key);
+                    taken_in_bucket = 0;
+                }
+                if taken_in_bucket < per_bucket {
+                    selected.push(cand);
+                    taken_in_bucket += 1;
+                } else {
+                    leftovers.push(cand);
+                }
+            }
+
+            let remaining_budget = MAX_BEAM_WIDTH.saturating_sub(selected.len());
+            for cand in leftovers.into_iter().take(remaining_budget) {
+                selected.push(cand);
+            }
+
+            candidates = selected;
         }
 
         if i > 0 && i % 500 == 0 {
