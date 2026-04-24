@@ -38,3 +38,6 @@
   - Parallelising per-candidate feed with rayon (each beam iteration's fork is embarrassingly parallel).
 - No algorithmic bugs discovered in the final run — beam width was the only tunable that mattered. Default `DEFAULT_MAX_BEAM_WIDTH = 2000` is too low for highly-corrupted binary streams; this PNG needed ≥ ~3000 to avoid beam-empty. 5000 worked. Consider bumping default to 4000–5000 and documenting the env-var override in README.
 - A `50k_stress` regression was green (20/20) during development — no regressions introduced.
+
+
+[SYSTEM: EMBEDDED]
