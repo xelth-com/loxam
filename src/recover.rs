@@ -12,6 +12,55 @@ use std::time::Instant;
 const BEAM_OUT_BUF_SIZE: usize = 32 * 1024;
 const MAX_BEAM_WIDTH: usize = 2000;
 
+/// Known magic-byte prefixes for common file types. Returned as a static slice
+/// of the raw bytes that MUST appear at offset 0 of the decoded output. Used
+/// by beam search to kill trajectories whose decoded content is impossible
+/// even if their decoder progression looks fine — a hard content oracle that
+/// cuts the stored-block blind spot.
+fn known_signature_for(filename: &str) -> &'static [u8] {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".png") {
+        &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        &[0xFF, 0xD8, 0xFF]
+    } else if lower.ends_with(".pdf") {
+        &[0x25, 0x50, 0x44, 0x46, 0x2D] // "%PDF-"
+    } else if lower.ends_with(".gif") {
+        &[0x47, 0x49, 0x46, 0x38] // "GIF8"
+    } else if lower.ends_with(".zip") || lower.ends_with(".jar") {
+        &[0x50, 0x4B, 0x03, 0x04]
+    } else if lower.ends_with(".gz") {
+        &[0x1F, 0x8B]
+    } else if lower.ends_with(".bz2") {
+        &[0x42, 0x5A, 0x68] // "BZh"
+    } else if lower.ends_with(".7z") {
+        &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]
+    } else if lower.ends_with(".mp3") {
+        &[0x49, 0x44, 0x33] // "ID3"
+    } else if lower.ends_with(".mp4") || lower.ends_with(".mov") {
+        // At offset 4, not offset 0, so harder; skip for now.
+        &[]
+    } else {
+        &[]
+    }
+}
+
+/// Known final bytes for file types whose trailer is fixed. Applied once, at
+/// the end of beam search, to filter winners before CRC check.
+fn known_trailer_for(filename: &str) -> &'static [u8] {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".png") {
+        // PNG IEND chunk: 4-byte length=0, "IEND", 4-byte CRC32 of "IEND"
+        &[0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82]
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        &[0xFF, 0xD9] // JPEG end-of-image marker
+    } else if lower.ends_with(".gif") {
+        &[0x3B] // GIF trailer byte
+    } else {
+        &[]
+    }
+}
+
 pub struct RecoveryResult {
     pub data: Vec<u8>,
     pub strategy: String,
@@ -396,11 +445,22 @@ fn try_per_file_fix(
             eprintln!("    {} LF positions in compressed data", lf_positions.len());
 
             let mut attempts = 0u64;
+            let expected_prefix = known_signature_for(&entry.name);
+            let expected_trailer = known_trailer_for(&entry.name);
+            if !expected_prefix.is_empty() || !expected_trailer.is_empty() {
+                eprintln!(
+                    "    content oracles: prefix={} bytes, trailer={} bytes",
+                    expected_prefix.len(),
+                    expected_trailer.len()
+                );
+            }
             let result = beam_search_fix_section(
                 compressed_data,
                 entry.crc32_expected,
                 entry.uncompressed_size,
                 &lf_positions,
+                expected_prefix,
+                expected_trailer,
                 &mut attempts,
             )
             .or_else(|| {
@@ -485,6 +545,10 @@ struct BeamCandidate {
     total_out: u64,
     inserts: Vec<usize>,
     done: bool,
+    /// `true` once the candidate's first `expected_prefix.len()` decoded bytes
+    /// have been verified to match the known file signature. Defaults to
+    /// `true` when there is no signature to check.
+    prefix_ok: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -501,7 +565,7 @@ enum FeedErr {
 }
 
 impl BeamCandidate {
-    fn new() -> Self {
+    fn new(has_signature: bool) -> Self {
         BeamCandidate {
             state: Box::new(DecompressorOxide::new()),
             hasher: crc32fast::Hasher::new(),
@@ -510,7 +574,66 @@ impl BeamCandidate {
             total_out: 0,
             inserts: Vec::new(),
             done: false,
+            prefix_ok: !has_signature,
         }
+    }
+
+    /// Returns true if the candidate should be kept under the signature oracle.
+    /// - If no signature configured (`prefix_ok` already true): keep.
+    /// - If not enough bytes decoded yet to cover the prefix: keep (too early
+    ///   to tell).
+    /// - If the LZ77 ring buffer has already wrapped past the prefix region
+    ///   without us validating first, we missed the window — trust the
+    ///   candidate (should not normally happen since we validate every LF).
+    /// - Otherwise compare out_buf[0..prefix.len()] against the signature.
+    fn check_prefix(&mut self, expected_prefix: &[u8]) -> bool {
+        if self.prefix_ok {
+            return true;
+        }
+        if expected_prefix.is_empty() {
+            self.prefix_ok = true;
+            return true;
+        }
+        let need = expected_prefix.len() as u64;
+        if self.total_out < need {
+            return true;
+        }
+        if self.total_out > self.out_buf.len() as u64 {
+            // Prefix region already overwritten in ring buffer — we missed it.
+            self.prefix_ok = true;
+            return true;
+        }
+        let matches = &self.out_buf[..expected_prefix.len()] == expected_prefix;
+        if matches {
+            self.prefix_ok = true;
+        }
+        matches
+    }
+
+    /// Compare the last `trailer.len()` emitted bytes against `trailer`. Bytes
+    /// live in a ring buffer at `(out_pos - k) % buf_len` for k = 1..=len.
+    /// Used once, after the final feed, to filter winners before CRC — cheap
+    /// and kills any candidate whose stream ended with wrong content.
+    fn ends_with_trailer(&self, trailer: &[u8]) -> bool {
+        if trailer.is_empty() {
+            return true;
+        }
+        let n = trailer.len();
+        if (self.total_out as usize) < n {
+            return false;
+        }
+        let buf_len = self.out_buf.len();
+        if n > buf_len {
+            return true; // trailer larger than window — can't check reliably
+        }
+        for (i, &expected) in trailer.iter().enumerate() {
+            let offset_from_end = n - 1 - i;
+            let pos = (self.out_pos + buf_len - 1 - offset_from_end) % buf_len;
+            if self.out_buf[pos] != expected {
+                return false;
+            }
+        }
+        true
     }
 
     fn feed(&mut self, chunk: &[u8], has_more_after: bool) -> Result<(), FeedErr> {
@@ -595,6 +718,8 @@ fn beam_search_fix_section(
     expected_crc: u32,
     expected_uncomp_size: u64,
     lf_positions: &[usize],
+    expected_prefix: &[u8],
+    expected_trailer: &[u8],
     total_attempts: &mut u64,
 ) -> Option<Vec<usize>> {
     if try_decompress_check(base, expected_crc) {
@@ -608,7 +733,9 @@ fn beam_search_fix_section(
     );
 
     let t = Instant::now();
-    let mut candidates: Vec<BeamCandidate> = vec![BeamCandidate::new()];
+    let has_signature = !expected_prefix.is_empty();
+    let mut candidates: Vec<BeamCandidate> = vec![BeamCandidate::new(has_signature)];
+    let mut prefix_kills: u64 = 0;
 
     let mut feed_start = 0usize;
 
@@ -673,6 +800,25 @@ fn beam_search_fix_section(
                 fork_b_kept + fork_b_killed
             );
             return None;
+        }
+
+        // Signature oracle: kill candidates whose first prefix bytes diverge
+        // from the known file magic. This cuts the stored-block blind spot
+        // because stored blocks emit decoded bytes verbatim — a wrong
+        // insertion within the signature region produces wrong output bytes
+        // that we can directly compare against the known prefix.
+        if has_signature {
+            let before = candidates.len();
+            candidates.retain_mut(|c| c.check_prefix(expected_prefix));
+            let killed = before - candidates.len();
+            prefix_kills += killed as u64;
+            if candidates.is_empty() {
+                eprintln!(
+                    "    beam empty after prefix check at LF #{} (prefix killed {} total so far)",
+                    i, prefix_kills
+                );
+                return None;
+            }
         }
 
         if candidates.len() > MAX_BEAM_WIDTH {
@@ -763,7 +909,7 @@ fn beam_search_fix_section(
             let done_count = candidates.iter().filter(|c| c.done).count();
 
             eprintln!(
-                "    LF {}/{}: beam={}, t={:.2}s | inserts [{},{},{}] buckets={} top=[{}] | out [{},{},{}]/{} done={} | forks a:{}+/{}- b:{}+/{}-",
+                "    LF {}/{}: beam={}, t={:.2}s | inserts [{},{},{}] buckets={} top=[{}] | out [{},{},{}]/{} done={} | forks a:{}+/{}- b:{}+/{}- | sig_kills={}",
                 i,
                 n,
                 candidates.len(),
@@ -775,12 +921,14 @@ fn beam_search_fix_section(
                 expected_uncomp_size,
                 done_count,
                 fork_a_kept, fork_a_killed,
-                fork_b_kept, fork_b_killed
+                fork_b_kept, fork_b_killed,
+                prefix_kills
             );
             fork_a_kept = 0;
             fork_a_killed = 0;
             fork_b_kept = 0;
             fork_b_killed = 0;
+            prefix_kills = 0;
         }
 
         feed_start = lf_pos + 1;
@@ -864,6 +1012,21 @@ fn beam_search_fix_section(
             expected_uncomp_size
         );
         return None;
+    }
+
+    if !expected_trailer.is_empty() {
+        let before = winners.len();
+        winners.retain(|c| c.ends_with_trailer(expected_trailer));
+        eprintln!(
+            "    trailer oracle: {} -> {} winners (trailer={} bytes)",
+            before,
+            winners.len(),
+            expected_trailer.len()
+        );
+        if winners.is_empty() {
+            eprintln!("    beam: no candidates match known trailer");
+            return None;
+        }
     }
 
     winners.sort_by_key(|c| c.inserts.len());
